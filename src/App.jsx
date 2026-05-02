@@ -60,18 +60,28 @@ function mkBubble(thought, W, H) {
 }
 
 // ─── Gemini ───────────────────────────────────────────────────────────────────
+let geminiLock = false
+
 async function callGemini(prompt) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-    }
-  )
-  const data = await res.json()
-  const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
-  return raw.replace(/```json|```/g, '').trim()
+  if (geminiLock) throw new Error('BUSY')
+  geminiLock = true
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      }
+    )
+    if (res.status === 429) throw new Error('RATE_LIMIT')
+    if (!res.ok) throw new Error('API_ERROR')
+    const data = await res.json()
+    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
+    return raw.replace(/```json|```/g, '').trim()
+  } finally {
+    geminiLock = false
+  }
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -96,6 +106,7 @@ export default function App() {
 
   // AI
   const [aiLoading, setAiLoading]     = useState(false)
+  const [aiError, setAiError]         = useState(null)
   const [statsData, setStatsData]     = useState(null)
   const [statsLoading, setStatsLoading] = useState(false)
 
@@ -275,6 +286,7 @@ export default function App() {
   const decomposeAI = async () => {
     if (!selected || aiLoading) return
     setAiLoading(true)
+    setAiError(null)
     try {
       const moodLabel = MOODS.find(m => m.id === selected.mood)?.label || ''
       const raw = await callGemini(
@@ -287,7 +299,11 @@ export default function App() {
       const nodos = (JSON.parse(raw).pasos || []).map(p => ({ id: uid(), texto: p, completado: false }))
       setThoughts(prev => prev.map(t => t.id === selected.id ? { ...t, nodos } : t))
       setSelected(prev => ({ ...prev, nodos }))
-    } catch (e) { console.error(e) }
+    } catch (e) {
+      if (e.message === 'RATE_LIMIT') setAiError('Límite de la IA alcanzado. Espera un momento e inténtalo de nuevo.')
+      else if (e.message === 'BUSY') setAiError('Ya hay una petición en curso. Espera un momento.')
+      else setAiError('Error al conectar con la IA.')
+    }
     setAiLoading(false)
   }
 
@@ -296,6 +312,7 @@ export default function App() {
     const t = thoughts.find(t => t.id === id)
     if (!t || aiLoading) return
     setAiLoading(true)
+    setAiError(null)
     try {
       const dias = daysBetween(t.fecha, new Date().toISOString())
       const raw = await callGemini(
@@ -306,7 +323,10 @@ export default function App() {
       )
       const msg = JSON.parse(raw).mensaje || '¿Sigue siendo relevante este pensamiento?'
       setSelected(prev => prev ? { ...prev, dormantMsg: msg } : prev)
-    } catch (e) { console.error(e) }
+    } catch (e) {
+      if (e.message === 'RATE_LIMIT') setAiError('Límite de la IA alcanzado. Espera un momento.')
+      else setAiError('Error al conectar con la IA.')
+    }
     setAiLoading(false)
   }
 
@@ -323,7 +343,7 @@ export default function App() {
   // ── Open detail ────────────────────────────────────────────────────────────
   const openDetail = (id) => {
     const t = thoughts.find(t => t.id === id)
-    if (t) setSelected(t)
+    if (t) { setSelected(t); setAiError(null) }
   }
 
   // ── Stats: AI classification ───────────────────────────────────────────────
@@ -344,13 +364,12 @@ export default function App() {
         `Máximo 5 categorías. Agrupa por tema real.`
       )
       setStatsData(JSON.parse(raw))
-    } catch (e) { setStatsData({ categorias: [], error: true }) }
+    } catch (e) {
+      if (e.message === 'RATE_LIMIT') setStatsData({ categorias: [], rateLimit: true })
+      else setStatsData({ categorias: [], error: true })
+    }
     setStatsLoading(false)
   }
-
-  useEffect(() => {
-    if (view === 'stats' && !statsData && !statsLoading) loadStats()
-  }, [view])
 
   // ── Voice input ────────────────────────────────────────────────────────────
   const toggleVoice = () => {
@@ -606,6 +625,12 @@ export default function App() {
             Categorías — análisis IA
           </div>
 
+          {/* Stats load button - manual trigger only */}
+          {!statsData && !statsLoading && (
+            <button onClick={loadStats} style={{ width: '100%', padding: '13px 0', borderRadius: 12, background: 'linear-gradient(135deg, rgba(99,179,237,0.16), rgba(154,117,234,0.16))', border: '1px solid rgba(99,179,237,0.32)', color: '#63b3ed', fontSize: 13, fontWeight: 700, marginBottom: 16 }}>
+              ✨ Analizar con IA
+            </button>
+          )}
           {statsLoading && (
             <div style={{ color: 'rgba(255,255,255,0.28)', fontSize: 13, textAlign: 'center', padding: '36px 0' }}>
               ✨ Analizando tus pensamientos...
@@ -614,6 +639,11 @@ export default function App() {
           {statsData?.noData && (
             <div style={{ color: 'rgba(255,255,255,0.18)', fontSize: 13, textAlign: 'center', padding: 28 }}>
               Aún no hay pensamientos completados para analizar.
+            </div>
+          )}
+          {statsData?.rateLimit && (
+            <div style={{ color: '#fbbf5a', fontSize: 13, textAlign: 'center', padding: 24 }}>
+              ⚠️ Límite de peticiones alcanzado. Espera un minuto e inténtalo de nuevo.
             </div>
           )}
           {statsData?.error && (
@@ -870,6 +900,13 @@ export default function App() {
               >
                 {aiLoading ? '✨ Pensando...' : '✨ Descomponer con IA'}
               </button>
+            )}
+
+            {/* AI Error */}
+            {aiError && (
+              <div style={{ background: 'rgba(246,135,135,0.08)', border: '1px solid rgba(246,135,135,0.25)', borderRadius: 12, padding: '10px 14px', marginBottom: 14, fontSize: 12, color: '#f68787', lineHeight: 1.4 }}>
+                ⚠️ {aiError}
+              </div>
             )}
 
             {/* Nodes */}
